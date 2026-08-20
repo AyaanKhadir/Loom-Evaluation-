@@ -1,8 +1,6 @@
 """
 Loom Video Evaluator – Production‑Ready
-- Robust JSON parsing
-- HTML report download
-- Clean UI with progress
+Robust error handling, progress bar, clean UI.
 """
 
 import streamlit as st
@@ -13,11 +11,9 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
-import base64
 
 import requests
 import plotly.graph_objects as go
-import plotly.io as pio
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -85,6 +81,7 @@ CRITERIA_NAMES = list(RUBRIC.keys())
 # ─── Transcript Cleaning ──────────────────────────────────────────────────
 
 def clean_transcript(text: str) -> str:
+    """Clean transcript: remove filler words, extra spaces, fix punctuation."""
     filler = r'\b(um|uh|er|ah|like|you know|so|actually|basically|literally)\b'
     text = re.sub(filler, '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text)
@@ -99,7 +96,7 @@ def extract_video_id(loom_url: str) -> str:
     pattern = r"loom\.com/share/([a-f0-9-]+)"
     match = re.search(pattern, loom_url)
     if not match:
-        raise ValueError("Invalid Loom URL")
+        raise ValueError("Invalid Loom URL – expected format: https://www.loom.com/share/...")
     return match.group(1)
 
 def fetch_transcript_url(loom_url: str):
@@ -110,15 +107,21 @@ def fetch_transcript_url(loom_url: str):
     video_title = title_match.group(1).strip() if title_match else "Unknown Title"
     video_title = re.sub(r"\s*\|\s*Loom$", "", video_title)
     transcript_url = ""
+    transcript_match = re.search(
+        r'source_url":"(https://cdn\.loom\.com/mediametadata/transcription/[^"\\]+)',
+        html,
+    )
+    if transcript_match:
+        transcript_url = urllib.parse.unquote(transcript_match.group(1))
     captions_url = ""
-    match = re.search(r'source_url":"(https://cdn\.loom\.com/mediametadata/transcription/[^"\\]+)', html)
-    if match:
-        transcript_url = urllib.parse.unquote(match.group(1))
-    match = re.search(r'captions_source_url":"(https://cdn\.loom\.com/mediametadata/captions/[^"\\]+)', html)
-    if match:
-        captions_url = urllib.parse.unquote(match.group(1))
+    captions_match = re.search(
+        r'captions_source_url":"(https://cdn\.loom\.com/mediametadata/captions/[^"\\]+)',
+        html,
+    )
+    if captions_match:
+        captions_url = urllib.parse.unquote(captions_match.group(1))
     if not transcript_url and not captions_url:
-        raise RuntimeError("No transcript found.")
+        raise RuntimeError("No transcript or captions URL found – video may not have captions.")
     return video_title, transcript_url, captions_url
 
 def fetch_transcript_json(transcript_url: str) -> str:
@@ -127,7 +130,7 @@ def fetch_transcript_json(transcript_url: str) -> str:
         data = json.loads(resp.read().decode("utf-8"))
     phrases = data.get("phrases", [])
     if not phrases:
-        raise RuntimeError("No phrases in transcript.")
+        raise RuntimeError("Transcript JSON has no 'phrases' data.")
     lines = []
     for p in phrases:
         ts = p.get("ts", 0)
@@ -165,6 +168,7 @@ def build_evaluation_prompt(transcript: str, video_title: str) -> str:
         for score, level_info in details["levels"].items():
             rubric_text += f"- **Score {score} ({level_info['label']})**: {level_info['description']}\n"
         rubric_text += "\n"
+
     prompt = f"""You are an expert evaluator for faculty digital activity submissions. You evaluate video submissions where faculty members explain a digital activity they have done in their online session.
 
 ## Video Being Evaluated
@@ -220,37 +224,19 @@ Return your evaluation as a valid JSON object with this EXACT structure:
 """
     return prompt
 
-# ─── Robust JSON Parser ──────────────────────────────────────────────────
-
 def parse_evaluation_json(content: str) -> dict:
-    """Attempt multiple strategies to extract and parse JSON."""
-    # Remove markdown fences
+    """Robust JSON extraction – tries multiple strategies."""
+    # Remove markdown code fences
     content = re.sub(r"```(?:json)?\s*", "", content)
     content = re.sub(r"```\s*", "", content)
 
-    # Try to find the first '{' and then balance braces.
-    # We'll also try to fix common issues like trailing commas.
-    def try_parse(s):
-        s = s.strip()
-        # Remove trailing commas inside objects/arrays
-        s = re.sub(r',\s*}', '}', s)
-        s = re.sub(r',\s*]', ']', s)
-        # Replace single quotes with double quotes for keys
-        s = re.sub(r"(\w+):", r'"\1":', s)
-        # Ensure keys are double-quoted
-        # Already handled by previous, but we'll also try to fix unquoted keys
-        s = re.sub(r'(\w+)(?=\s*:)', r'"\1"', s)
-        try:
-            return json.loads(s, strict=False)
-        except json.JSONDecodeError:
-            return None
+    # Strategy 1: Direct parse
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
 
-    # Strategy 1: direct
-    parsed = try_parse(content)
-    if parsed is not None:
-        return parsed
-
-    # Strategy 2: extract substring from first '{' to matching '}'
+    # Strategy 2: Find first '{' and matching '}'
     start = content.find('{')
     if start != -1:
         depth = 0
@@ -264,22 +250,28 @@ def parse_evaluation_json(content: str) -> dict:
                     end = i
                     break
         if end != -1:
-            candidate = content[start:end+1]
-            parsed = try_parse(candidate)
-            if parsed is not None:
-                return parsed
+            try:
+                return json.loads(content[start:end+1])
+            except json.JSONDecodeError:
+                pass
 
-    # Strategy 3: regex fallback
+    # Strategy 3: Regex fallback
     match = re.search(r'\{.*\}', content, re.DOTALL)
     if match:
-        candidate = match.group(0)
-        parsed = try_parse(candidate)
-        if parsed is not None:
-            return parsed
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
 
-    raise RuntimeError(f"Could not parse JSON. Preview: {content[:500]}\nFull length: {len(content)}")
+    # If all fail, raise with a preview
+    raise RuntimeError(
+        f"Could not parse JSON from LLM response.\n"
+        f"Preview: {content[:500]}\n"
+        f"(Full length: {len(content)} chars)"
+    )
 
 def evaluate_with_openrouter(prompt: str) -> dict:
+    """Non‑streaming call with progress updates (handled outside)."""
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
@@ -304,36 +296,50 @@ def evaluate_with_openrouter(prompt: str) -> dict:
 
 # ─── Visualisation Functions ──────────────────────────────────────────────
 
-def create_radar_chart(scores: dict):
+def create_radar_chart(scores: dict, title: str = "Score Dashboard"):
+    categories = list(scores.keys())
+    values = list(scores.values())
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(
-        r=list(scores.values()),
-        theta=list(scores.keys()),
+        r=values,
+        theta=categories,
         fill='toself',
+        name='Scores',
         line_color='#2E86C1',
         fillcolor='rgba(46, 134, 193, 0.3)'
     ))
     fig.update_layout(
         polar=dict(
-            radialaxis=dict(range=[0, 3], tickvals=[1,2,3], ticktext=['1','2','3'])
+            radialaxis=dict(
+                visible=True,
+                range=[0, 3],
+                tickvals=[1, 2, 3],
+                ticktext=['1 (Emerging)', '2 (Proficient)', '3 (Outstanding)']
+            ),
         ),
         showlegend=False,
+        title=title,
         height=400,
-        margin=dict(l=80, r=80, t=40, b=80)
+        margin=dict(l=80, r=80, t=60, b=80)
     )
     return fig
 
-def create_bar_chart(scores: dict):
-    cats = list(scores.keys())
-    vals = list(scores.values())
-    colors = ['#27AE60' if v>=2.5 else '#F39C12' if v>=1.5 else '#E74C3C' for v in vals]
+def create_bar_chart(scores: dict, title: str = "Scores per Criterion"):
+    categories = list(scores.keys())
+    values = list(scores.values())
+    colors = ['#27AE60' if v >= 2.5 else '#F39C12' if v >= 1.5 else '#E74C3C' for v in values]
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=vals, y=cats, orientation='h',
-        marker_color=colors, text=vals, textposition='outside'
+        x=values,
+        y=categories,
+        orientation='h',
+        marker_color=colors,
+        text=values,
+        textposition='outside',
+        hovertemplate='%{y}: %{x}/3<extra></extra>'
     ))
     fig.update_layout(
-        xaxis=dict(range=[0,3.2], tickvals=[1,2,3], title='Score'),
+        xaxis=dict(range=[0, 3.2], tickvals=[1, 2, 3], title='Score'),
         yaxis=dict(title=''),
         height=300,
         margin=dict(l=0, r=40, t=30, b=20),
@@ -341,104 +347,28 @@ def create_bar_chart(scores: dict):
     )
     return fig
 
-# ─── Report Generation ────────────────────────────────────────────────────
-
-def generate_html_report(evaluation: dict, scores_dict: dict, video_title: str, video_id: str) -> str:
-    total = sum(scores_dict.values()) if scores_dict else 0
-    avg = total/5 if scores_dict else 0
-
-    # Create plotly figures as HTML
-    radar_html = pio.to_html(create_radar_chart(scores_dict), include_plotlyjs='cdn', full_html=False)
-    bar_html = pio.to_html(create_bar_chart(scores_dict), include_plotlyjs='cdn', full_html=False)
-
-    criteria_html = ""
-    for i, crit in enumerate(evaluation.get("criteria", []), 1):
-        criteria_html += f"""
-        <div style="margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem;">
-            <h3 style="color: #2E86C1;">{i}. {crit.get('criterion')} – Score: {crit.get('score')}/3 ({crit.get('label')})</h3>
-            <p><strong>Evidence:</strong><br>{crit.get('evidence', 'N/A')}</p>
-            <p><strong>Justification:</strong><br>{crit.get('justification', 'N/A')}</p>
-            <p><strong>Gap Analysis:</strong><br>{crit.get('gap_analysis', 'N/A')}</p>
-            <p><strong>Strengths:</strong><br>{crit.get('strengths', 'N/A')}</p>
-        </div>
-        """
-
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Loom Evaluation Report</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 2rem auto; padding: 1rem; color: #2C3E50; }}
-        h1 {{ color: #2E86C1; border-bottom: 2px solid #2E86C1; padding-bottom: 0.5rem; }}
-        .summary {{ display: flex; gap: 2rem; background: #F8F9FA; padding: 1.5rem; border-radius: 8px; margin: 1.5rem 0; }}
-        .metric {{ flex: 1; text-align: center; }}
-        .metric-value {{ font-size: 2.2rem; font-weight: 700; color: #2E86C1; }}
-        .metric-label {{ font-size: 0.9rem; color: #5D6D7E; }}
-        .charts {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 2rem 0; }}
-        .charts > div {{ flex: 1; min-width: 300px; }}
-        .feedback {{ background: #E8F8F5; padding: 1rem; border-radius: 8px; margin: 1.5rem 0; border-left: 4px solid #1ABC9C; }}
-        .footer {{ margin-top: 3rem; font-size: 0.8rem; color: #95A5A6; border-top: 1px solid #ddd; padding-top: 1rem; text-align: center; }}
-    </style>
-</head>
-<body>
-    <h1>📊 Loom Activity Evaluation Report</h1>
-    <p><strong>Video Title:</strong> {video_title}</p>
-    <p><strong>Evaluated on:</strong> {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</p>
-
-    <div class="summary">
-        <div class="metric"><div class="metric-value">{total}/15</div><div class="metric-label">Total Score</div></div>
-        <div class="metric"><div class="metric-value">{avg:.1f}/3</div><div class="metric-label">Average Score</div></div>
-    </div>
-
-    <div class="charts">
-        <div>{radar_html}</div>
-        <div>{bar_html}</div>
-    </div>
-
-    <h2>📝 Detailed Criteria</h2>
-    {criteria_html}
-
-    <div class="feedback">
-        <h3 style="margin-top:0;">💬 Overall Feedback</h3>
-        <p>{evaluation.get('overall_feedback', 'N/A')}</p>
-    </div>
-
-    <div class="footer">
-        Generated by Loom Video Evaluator • Report ID: {video_id}
-    </div>
-</body>
-</html>
-"""
-    return html
-
 # ─── Streamlit UI ────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Loom Digital Activity Evaluator", layout="wide", page_icon="🎥")
 
+# Custom CSS
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: 700; color: #2E86C1; margin-bottom: 0; }
     .sub-header { font-size: 1.1rem; color: #5D6D7E; margin-top: -5px; }
     .score-card { background: #F8F9FA; padding: 1.5rem; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .metric-label { font-weight: 600; color: #2C3E50; }
+    .metric-value { font-size: 2rem; font-weight: 700; color: #2E86C1; }
+    .divider { border-top: 2px solid #E5E7EB; margin: 1.5rem 0; }
     .stProgress > div > div { background-color: #2E86C1; }
     .stAlert { border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
+# ─── Header ──────────────────────────────────────────────────────────────────
+
 st.markdown('<p class="main-header">🎥 Loom Digital Activity Evaluator</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Paste a Loom share URL to evaluate against our rubric</p>', unsafe_allow_html=True)
-
-# Session state for persistence
-if "evaluation" not in st.session_state:
-    st.session_state.evaluation = None
-if "transcript" not in st.session_state:
-    st.session_state.transcript = None
-if "video_id" not in st.session_state:
-    st.session_state.video_id = None
-if "video_title" not in st.session_state:
-    st.session_state.video_title = None
 
 # ─── Input Form ─────────────────────────────────────────────────────────────
 
@@ -450,15 +380,23 @@ with st.container():
         with col2:
             submitted = st.form_submit_button("🚀 Evaluate", use_container_width=True)
 
+# ─── Session State for persisting results ────────────────────────────────────
+
+if "evaluation" not in st.session_state:
+    st.session_state.evaluation = None
+if "transcript" not in st.session_state:
+    st.session_state.transcript = None
+
 # ─── Evaluation Flow ──────────────────────────────────────────────────────
 
 if submitted and loom_url:
-    # Reset previous
+    # Clear previous results
     st.session_state.evaluation = None
     st.session_state.transcript = None
 
+    # --- Step 1: Fetch transcript ---
+    status_placeholder = st.empty()
     progress_bar = st.progress(0, text="Starting...")
-    status_text = st.empty()
 
     with st.status("📡 Fetching video data...", expanded=True) as status:
         try:
@@ -476,7 +414,7 @@ if submitted and loom_url:
             status.write(f"📹 Title: **{video_title}**")
         except Exception as e:
             status.update(label="❌ Error", state="error")
-            st.error(f"Page error: {e}")
+            st.error(f"Failed to fetch page: {e}")
             st.stop()
 
         try:
@@ -497,89 +435,84 @@ if submitted and loom_url:
         prompt = build_evaluation_prompt(transcript, video_title)
         status.write("✅ Prompt built")
         progress_bar.progress(100, text="Done")
-        elapsed = time.time() - start_time
-        status.write(f"⏱️ Fetch completed in {elapsed:.1f}s")
 
-    # AI Evaluation
-    status_text.empty()
+    # --- Step 2: Evaluate with AI ---
+    status_placeholder.empty()
     st.markdown("---")
     st.subheader("🤖 AI Evaluation")
 
+    # Progress bar for AI call
     ai_progress = st.progress(0, text="⏳ Connecting to AI...")
     ai_status = st.empty()
-    start_eval = time.time()
 
     try:
-        # Simple non‑streaming with progress simulation
-        # We'll update progress based on elapsed time (assume ~60s)
-        import threading
-        stop = False
-        def update_ai_progress():
-            t = 0
-            while not stop:
-                time.sleep(0.5)
-                t += 0.5
-                pct = min(90, int((t / 60) * 100))
-                ai_progress.progress(pct, text=f"⏳ Evaluating... {t:.0f}s elapsed")
-                if t > 60:
-                    ai_status.warning("Still working... This may take a moment.")
-        thread = threading.Thread(target=update_ai_progress)
-        thread.start()
+        start_time = time.time()
+        # Simulate progress while waiting for the API call
+        # We'll update progress in a loop while the request is in progress (using a separate thread or simple polling)
+        # Since we can't easily poll, we'll just show a spinner and update after completion.
+        # We'll use st.spinner for simplicity, but we also want a progress bar.
+        # We'll do a stepwise progress after the call completes.
+        with st.spinner("Evaluating with AI... (takes ~30-90s)"):
+            evaluation = evaluate_with_openrouter(prompt)
+        elapsed = time.time() - start_time
+        ai_progress.progress(100, text=f"✅ Completed in {elapsed:.1f}s")
+        ai_status.success(f"✅ Evaluation finished in {elapsed:.1f}s")
 
-        evaluation = evaluate_with_openrouter(prompt)
-
-        stop = True
-        thread.join(timeout=1)
-        elapsed_eval = time.time() - start_eval
-        ai_progress.progress(100, text=f"✅ Completed in {elapsed_eval:.1f}s")
-        ai_status.success(f"✅ Evaluation finished in {elapsed_eval:.1f}s")
+        # Validate evaluation structure
+        if not isinstance(evaluation, dict) or "criteria" not in evaluation:
+            raise RuntimeError("Invalid evaluation structure – missing 'criteria'")
 
         # Store in session state
         st.session_state.evaluation = evaluation
         st.session_state.transcript = transcript
         st.session_state.video_id = video_id
-        st.session_state.video_title = video_title
 
     except Exception as e:
-        stop = True
         ai_progress.empty()
         st.error(f"Evaluation failed: {e}")
+        # Show a button to retry (will rerun the script)
         if st.button("🔄 Retry Evaluation"):
             st.rerun()
         st.stop()
 
-    # --- Display Results ---
+    # --- Step 3: Display results ---
     if st.session_state.evaluation:
         evaluation = st.session_state.evaluation
         transcript = st.session_state.transcript
         video_id = st.session_state.video_id
-        video_title = st.session_state.video_title
 
         st.markdown("---")
         st.subheader(f"📊 Evaluation: {evaluation.get('video_title', video_title)}")
 
+        # Extract scores
         scores_dict = {}
         for crit in evaluation.get("criteria", []):
             name = crit.get("criterion")
             score = crit.get("score", 0)
             if name in CRITERIA_NAMES:
                 scores_dict[name] = score
+
         total_score = sum(scores_dict.values()) if scores_dict else 0
 
+        # Dashboard layout
         col1, col2 = st.columns([2, 1])
+
         with col1:
             if scores_dict:
                 fig_radar = create_radar_chart(scores_dict)
                 st.plotly_chart(fig_radar, use_container_width=True)
+
         with col2:
             st.markdown('<div class="score-card">', unsafe_allow_html=True)
             st.metric("Total Score", f"{total_score}/15")
             st.metric("Average Score", f"{total_score/5:.1f}/3")
             st.markdown('</div>', unsafe_allow_html=True)
+
             if scores_dict:
                 fig_bar = create_bar_chart(scores_dict)
                 st.plotly_chart(fig_bar, use_container_width=True)
 
+        # Detailed criteria expanders
         st.markdown("### 📝 Detailed Criteria Evaluation")
         for i, crit in enumerate(evaluation.get("criteria", []), 1):
             with st.expander(f"{i}. {crit.get('criterion')} – Score: {crit.get('score')}/3 ({crit.get('label')})", expanded=(i==1)):
@@ -588,53 +521,45 @@ if submitted and loom_url:
                 st.markdown(f"**🔍 Gap Analysis:**\n{crit.get('gap_analysis', 'N/A')}")
                 st.markdown(f"**💪 Strengths:**\n{crit.get('strengths', 'N/A')}")
 
+        # Overall feedback
         st.markdown("### 💬 Overall Feedback")
         st.success(evaluation.get("overall_feedback", "N/A"))
 
-        # ─── Download Report Button ──────────────────────────────────────
-        if scores_dict:
-            html_report = generate_html_report(evaluation, scores_dict, video_title, video_id)
-            st.download_button(
-                label="📄 Download Neat Report (HTML)",
-                data=html_report,
-                file_name=f"evaluation_report_{video_id}.html",
-                mime="text/html",
-                use_container_width=True,
-            )
-
-        # Download JSON
+        # Download button
         json_output = {
             "evaluated_at": datetime.now().isoformat(),
             "evaluation": evaluation,
             "transcript": transcript,
+            "cleaned": True,
         }
         st.download_button(
-            label="📥 Download Raw JSON",
+            label="📥 Download Full Results (JSON)",
             data=json.dumps(json_output, indent=2, ensure_ascii=False),
             file_name=f"evaluation_{video_id}.json",
             mime="application/json",
             use_container_width=True,
         )
 
+        # Optional transcript viewer
         with st.expander("📄 Show Full Transcript"):
             st.text_area("Transcript", transcript, height=300)
 
+        # Clear progress indicators
         ai_progress.empty()
         ai_status.empty()
 
 elif submitted and not loom_url:
     st.warning("Please enter a Loom URL.")
 
-# If there is a previous evaluation in session state (e.g., after refresh)
+# If there is a previous evaluation stored (e.g. after rerun), show it
 elif st.session_state.evaluation is not None:
-    # Re‑display results (same as above, but we can keep it simple)
+    # Re‑display results (in case user refreshed or came back)
+    st.markdown("---")
+    st.subheader("📊 Previous Evaluation")
+    # We'll re‑render the results using the stored data
     evaluation = st.session_state.evaluation
     transcript = st.session_state.transcript
-    video_id = st.session_state.video_id
-    video_title = st.session_state.video_title
-
-    st.markdown("---")
-    st.subheader(f"📊 Evaluation: {evaluation.get('video_title', video_title)}")
+    video_id = st.session_state.video_id if hasattr(st.session_state, 'video_id') else "unknown"
 
     scores_dict = {}
     for crit in evaluation.get("criteria", []):
@@ -665,13 +590,3 @@ elif st.session_state.evaluation is not None:
             st.markdown(f"**Strengths:**\n{crit.get('strengths', 'N/A')}")
 
     st.success(evaluation.get("overall_feedback", "N/A"))
-
-    if scores_dict:
-        html_report = generate_html_report(evaluation, scores_dict, video_title, video_id)
-        st.download_button(
-            label="📄 Download Neat Report (HTML)",
-            data=html_report,
-            file_name=f"evaluation_report_{video_id}.html",
-            mime="text/html",
-            use_container_width=True,
-        )
